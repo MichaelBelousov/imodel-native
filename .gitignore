@@ -57,3 +57,12 @@ LastCoverageResults.log
 
 # graphify output directory
 graphify-out/
+.zig-cache/
+zig-out/
+zig-pkg/
+
+# native
+*.o
+
+# TODO: fixme
+zig-out-release

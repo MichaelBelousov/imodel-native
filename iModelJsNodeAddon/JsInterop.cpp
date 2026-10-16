@@ -25,6 +25,8 @@
 
 #if defined (BENTLEYCONFIG_PARASOLID)
 #include <PSBRepGeometry/PSBRepGeometry.h>
+#elif defined (BENTLEYCONFIG_SMLIB)
+#include <SMBRepGeometry/SMBRepGeometry.h>
 #endif
 
 static Utf8String s_lastECDbIssue;
@@ -389,6 +391,8 @@ private:
 #endif
 #if defined (BENTLEYCONFIG_PARASOLID)
     BRepGeometryAdmin& _SupplyBRepGeometryAdmin() override {return *new BentleyApi::Psolid::PSolidKernelAdmin();}
+#elif defined (BENTLEYCONFIG_SMLIB)
+    BRepGeometryAdmin& _SupplyBRepGeometryAdmin() override {return *new Dgn::SMLibKernelAdmin();}
 #endif
 
 public:
