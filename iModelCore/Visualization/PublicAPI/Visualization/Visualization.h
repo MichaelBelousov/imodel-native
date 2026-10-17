@@ -6,6 +6,6 @@
 
 #include <DgnPlatform/Visualization.h>
 
-// Open-source stand-in for Bentley's private Visualization module. Produces no tiles and no
-// element graphics; requests for either report that there is nothing to show.
+// Open-source stand-in for Bentley's private Visualization module. Produces iMdl tiles for 3d
+// spatial models; element graphics requests report that there is nothing to show.
 BentleyApi::Dgn::Visualization* iTwinVisualization_create(BentleyApi::Dgn::Render::System* renderSystem);

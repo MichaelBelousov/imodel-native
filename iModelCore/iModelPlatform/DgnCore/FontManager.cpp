@@ -441,7 +441,7 @@ bool FontManager::AddWorkspaceDb(Utf8CP inName, CloudContainerP container) {
 
 /** Get the Mutex for all font related activities */
 BeMutex& FontManager::GetMutex() {
-#if defined (__APPLE__)
+#if defined (__APPLE__) || defined (_LIBCPP_VERSION)
     // This mutex is used in an atexit handler, and static initialization and cleanup order
     // brokenness means that this code may execute after s_fontsMutex has been destroyed. That
     // leads to a runtime exception. Doing it this way means that the mutex is "leaked", but since

@@ -21,6 +21,10 @@
             .url = "https://github.com/iTwin/bis-schemas/archive/7f0321be51f78a781f8f41749e44f57809ac94f7.tar.gz",
             .hash = "N-V-__8AAOglRAPsxbhfxGhzXHyM4qU2HaOeMbxsiZsQJp7s",
         },
+        .meshoptimizer = .{
+            .url = "https://github.com/zeux/meshoptimizer/archive/refs/tags/v1.3.tar.gz",
+            .hash = "N-V-__8AAMexJQB791CEydy9LrMMkHO21qTqFvwU2Lx4R5Oj",
+        },
     },
     .paths = .{
         "build.zig",

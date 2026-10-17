@@ -26,9 +26,11 @@ using BodyPtr = std::unique_ptr<Body, BodyDeleter>;
 
 enum class Kind { Solid, Sheet, Wire };
 
-//! Read a body written by Save, along with its face tags. Returns null for anything else,
-//! including Parasolid data.
-BodyPtr Restore(uint8_t const* data, size_t size, std::vector<uint32_t>& faceTags);
+//! Read a body written by Save, along with its face tags, or rebuild one from Parasolid transmit
+//! data, whose face tags are the face symbology indices Bentley's Parasolid admin attached.
+//! Returns null for anything else. A body rebuilt from Parasolid data is `scale` times the size
+//! the data describes, a power of two chosen to suit SMLib; scale its transform by 1/scale.
+BodyPtr Restore(uint8_t const* data, size_t size, std::vector<uint32_t>& faceTags, double& scale);
 //! Serialize a body with one caller-defined tag per face (e.g. a symbology index), since SMLib
 //! faces carry no persistent attributes here. Tags may be empty.
 bool Save(Body const& body, std::vector<uint32_t> const& faceTags, std::vector<uint8_t>& out);

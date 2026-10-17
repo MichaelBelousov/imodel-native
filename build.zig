@@ -364,10 +364,22 @@ fn coreLibs(ctx: *const Ctx, third: ThirdParty) Core {
         .defines = coreDefines(b, &.{ "__DGNPLATFORM_BUILD__", "NOMINMAX" }),
         .includes = &.{ "iModelCore/iModelPlatform", "iModelCore/iModelPlatform/PrivateApi", "iModelCore/libsrc/freetype2/vendor/include" },
     });
+    const meshoptimizer = b.dependency("meshoptimizer", .{});
     const visualization = ctx.lib("iTwinVisualization", .{
-        .sources = &.{"iModelCore/Visualization/Visualization.cpp"},
+        .sources = &.{
+            "iModelCore/Visualization/Visualization.cpp",
+            "iModelCore/Visualization/ElementMesher.cpp",
+            "iModelCore/Visualization/ImdlWriter.cpp",
+        },
+        .dep_sources = .{ .dep = meshoptimizer, .files = &.{
+            "src/allocator.cpp",
+            "src/simplifier.cpp",
+            "src/vfetchoptimizer.cpp",
+            "src/indexgenerator.cpp",
+        } },
         .defines = coreDefines(b, &.{}),
     });
+    visualization.root_module.addIncludePath(meshoptimizer.path("src"));
     const brep = smlibBRep(ctx);
     return .{
         .bentley = bentley,
@@ -537,7 +549,7 @@ fn smlibBRep(ctx: *const Ctx) *Compile {
     });
     const kernel = ctx.lib("iTwinSmKernel", .{
         .core = false,
-        .sources = &.{"iModelCore/SMBRepGeometry/SmKernel.cpp"},
+        .sources = &.{ "iModelCore/SMBRepGeometry/SmKernel.cpp", "iModelCore/SMBRepGeometry/SmParasolid.cpp", "iModelCore/SMBRepGeometry/ParasolidXT.cpp" },
         // Must match how usd-brep compiled SMLib: its class layouts depend on these.
         .defines = if (ctx.optimize == .Debug)
             &.{ "NOMINMAX", "SM_NO_DEBUG_CODE", "SM_NO_GFX_OUTPUT_CODE", "_DEBUG" }
@@ -553,6 +565,15 @@ fn smlibBRep(ctx: *const Ctx) *Compile {
     test_mod.linkLibrary(kernel);
     const run_test = b.addRunArtifact(b.addExecutable(.{ .name = "smkernel-test", .root_module = test_mod }));
     b.step("smkernel-test", "Check the SMLib operations behind createBRepGeometry").dependOn(&run_test.step);
+
+    const xt_mod = b.createModule(.{ .target = ctx.target, .optimize = ctx.optimize, .link_libc = true, .link_libcpp = true });
+    xt_mod.addCSourceFile(.{ .file = b.path("iModelCore/SMBRepGeometry/test/ParasolidTest.cpp"), .flags = &.{"-std=c++20"} });
+    xt_mod.linkLibrary(kernel);
+    xt_mod.addIncludePath(usd_brep.path("source/SMLib/inc"));
+    xt_mod.addIncludePath(usd_brep.path("source/SM_API/inc"));
+    for (kernel.root_module.c_macros.items) |m| xt_mod.c_macros.append(b.allocator, m) catch @panic("OOM");
+    const xt_test = b.addExecutable(.{ .name = "parasolid-test", .root_module = xt_mod });
+    b.step("parasolid-test", "Build bin/parasolid-test, which rebuilds Parasolid transmit files with SMLib").dependOn(&b.addInstallArtifact(xt_test, .{}).step);
 
     return ctx.lib("iTwinSMBRepGeometry", .{
         .sources = &.{"iModelCore/SMBRepGeometry/SMBRepGeometry.cpp"},

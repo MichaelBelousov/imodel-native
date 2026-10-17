@@ -12,8 +12,8 @@ BEGIN_BENTLEY_DGN_NAMESPACE
 //! A BRep geometry admin backed by the open-source SMLib solid modeling kernel.
 //!
 //! B-reps are persisted in SMLib's own format under GeometryStreamIO::OpCode::ParasolidBRep, tagged
-//! so they are never mistaken for Parasolid data. Parasolid b-reps in existing iModels cannot be
-//! restored and are skipped like on a platform without a solid kernel.
+//! so they are never mistaken for Parasolid data. Parasolid b-reps in existing iModels are rebuilt
+//! in SMLib from their transmit data when restored.
 //=======================================================================================
 struct SMLibKernelAdmin : PlatformLib::Host::BRepGeometryAdmin
 {

@@ -41,10 +41,24 @@ node zig/brep-test.js zig-out/imodeljs-linux-x64/imodeljs.node path/to/node_modu
     regions. Sweep paths are line segments (with mitered corners) or a single smooth curve. A
     sheet subtracted from or intersected with a solid must be planar; it acts as a half space.
     Emboss works on solids and planar regions.
-  - Not supported: reading Parasolid b-reps in existing iModels. They fail to restore, as on a
-    platform without a solid kernel. B-rep snapping also reports failure.
-- **Visualization is a stub** (`iModelCore/Visualization`). It produces no tiles, and element
-  graphics requests resolve as `NoGeometry`.
+  - Parasolid b-reps in existing iModels (bare binary XT, schema 12006) are read by
+    `ParasolidXT.cpp` and rebuilt as SMLib bodies by `SmParasolid.cpp`: planes, cylinders, cones,
+    spheres, tori, B-surfaces, offset and swept surfaces, rolling-ball blends along circles and
+    ellipses, and lines, arcs, B-curves, SP-curves and intersection curves. Not supported: spun
+    surfaces, blends along intersection curves (such bodies restore as open sheets), text XT and
+    other base schemas. `zig build parasolid-test` builds a harness for extracted blobs.
+  - B-rep snapping reports failure.
+- **Visualization is a replacement** (`iModelCore/Visualization`). It produces iMdl tiles for 2d and
+  3d models and element graphics for single elements or dynamic geometry. Each element is faceted at
+  the tile's chord tolerance, as `exportGraphics` does, simplified to that tolerance with
+  [meshoptimizer](https://github.com/zeux/meshoptimizer), and clipped to the tile.
+  - Supported: surfaces with crease edges and silhouettes, open curves, filled and unfilled regions,
+    text, texture-mapped materials (pattern maps), and planar classifier trees.
+  - Not supported: volume classifier trees, instancing of geometry parts (each instance is faceted
+    separately), schedule animation node splitting, section cuts, line styles and area patterns,
+    render material properties other than color and transparency, and a persistent tile cache.
+  - `node zig/viz/dump-tiles.cjs` dumps tile trees and root tiles, e.g. to compare with Bentley's addon.
+    `node zig/viz/make-test-imodel.cjs` writes a small iModel exercising each kind of graphic.
 - **No crash reporting.** Crashpad isn't built; `iModelJsNodeAddon/CrashReportingNone.cpp` stands in
   for it.
 - **The unit tests (gtest) aren't built.**

@@ -9,8 +9,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <list>
 #include <map>
+#include <mutex>
 #include <optional>
+#include <string_view>
+#include <tuple>
+#include <unordered_map>
 
 USING_NAMESPACE_BENTLEY_DGN
 
@@ -18,6 +23,12 @@ namespace {
 
 using Lock = std::lock_guard<std::recursive_mutex>;
 using BodyRef = std::shared_ptr<SmKernel::Body>;
+
+//! Guards the ranges entities share, apart from SMLib so a range doesn't wait on a tessellation.
+std::mutex& RangeMutex() {
+    static std::mutex* s_mutex = new std::mutex(); // never destroyed, like SmKernel::Mutex()
+    return *s_mutex;
+}
 
 BodyRef Share(SmKernel::BodyPtr body) {
     return BodyRef(body.release(), [](SmKernel::Body* b) {
@@ -44,7 +55,8 @@ struct SMLibEntity : RefCounted<IBRepEntity> {
     bvector<uint32_t> m_faceSymbology;
     //! Output of _SaveEntityToMemory, which the entity owns.
     mutable std::vector<uint8_t> m_saved;
-    mutable std::optional<DRange3d> m_localRange;
+    //! Shared by the entities of one body, which never changes.
+    std::shared_ptr<std::optional<DRange3d>> m_localRange = std::make_shared<std::optional<DRange3d>>();
 
     SMLibEntity(BodyRef body, TransformCR transform) : m_body(std::move(body)), m_transform(transform) { }
 
@@ -75,12 +87,21 @@ struct SMLibEntity : RefCounted<IBRepEntity> {
     }
 
     DRange3d _GetLocalEntityRange() const override {
-        if (!m_localRange) {
-            double low[3], high[3];
-            Lock lock(SmKernel::Mutex());
-            m_localRange = SmKernel::GetRange(Body(), low, high) ? DRange3d::From(DPoint3d::FromArray(low), DPoint3d::FromArray(high)) : DRange3d::NullRange();
+        {
+            std::lock_guard<std::mutex> guard(RangeMutex());
+            if (*m_localRange)
+                return **m_localRange;
         }
-        return *m_localRange;
+        double low[3], high[3];
+        DRange3d computed;
+        {
+            Lock lock(SmKernel::Mutex());
+            computed = SmKernel::GetRange(Body(), low, high) ? DRange3d::From(DPoint3d::FromArray(low), DPoint3d::FromArray(high)) : DRange3d::NullRange();
+        }
+        std::lock_guard<std::mutex> guard(RangeMutex());
+        if (!*m_localRange)
+            *m_localRange = computed;
+        return **m_localRange;
     }
 
     DRange3d _GetEntityRange() const override {
@@ -281,9 +302,74 @@ bvector<PolyfaceHeaderPtr> ToPolyfaces(SmKernel::Mesh const& mesh, size_t groupC
     return polyfaces;
 }
 
+//=======================================================================================
+// Recent tessellations by body and options. Tile generation facets an element for every tile it
+// appears in, mostly at the same tolerance. Accessed with SmKernel::Mutex() held.
+//=======================================================================================
+struct RecentMeshes {
+    using Key = std::tuple<SmKernel::Body const*, double, double, double>;
+    struct Entry {
+        Key m_key;
+        BodyRef m_body; // keeps the key's body from being freed and its address reused
+        SmKernel::Mesh m_mesh;
+        size_t m_bytes = 0;
+    };
+    static constexpr size_t kMaxBytes = size_t(256) << 20;
+    std::list<Entry> m_entries; // most recently used first
+    std::map<Key, std::list<Entry>::iterator> m_index;
+    size_t m_bytes = 0;
+
+    static RecentMeshes& Get() {
+        static RecentMeshes* s_meshes = new RecentMeshes(); // never destroyed, like RestoredBodies
+        return *s_meshes;
+    }
+
+    static size_t Bytes(SmKernel::Mesh const& mesh) {
+        return sizeof(double) * (mesh.points.size() + mesh.normals.size() + mesh.params.size()) +
+            sizeof(uint32_t) * (mesh.facetSizes.size() + mesh.indices.size() + mesh.facetFaces.size());
+    }
+
+    SmKernel::Mesh const* Find(Key const& key) {
+        auto found = m_index.find(key);
+        if (found == m_index.end())
+            return nullptr;
+        m_entries.splice(m_entries.begin(), m_entries, found->second);
+        return &found->second->m_mesh;
+    }
+
+    void Add(Key const& key, BodyRef body, SmKernel::Mesh const& mesh) {
+        size_t const bytes = Bytes(mesh);
+        if (bytes > kMaxBytes / 8)
+            return;
+        m_entries.push_front(Entry{key, std::move(body), mesh, bytes});
+        m_index[key] = m_entries.begin();
+        m_bytes += bytes;
+        while (m_bytes > kMaxBytes) {
+            m_bytes -= m_entries.back().m_bytes;
+            m_index.erase(m_entries.back().m_key);
+            m_entries.pop_back();
+        }
+    }
+
+    void Clear() {
+        m_index.clear();
+        m_entries.clear();
+        m_bytes = 0;
+    }
+};
+
 bool Tessellate(SMLibEntity const& entity, IFacetOptionsCR options, SmKernel::Mesh& mesh) {
+    SmKernel::TessellationOptions const kernelOptions = ToKernelOptions(options, entity.m_transform);
+    RecentMeshes::Key const key(&entity.Body(), kernelOptions.chordTolerance, kernelOptions.angleToleranceDegrees, kernelOptions.maxEdgeLength);
     Lock lock(SmKernel::Mutex());
-    return SmKernel::Tessellate(entity.Body(), ToKernelOptions(options, entity.m_transform), mesh);
+    if (auto found = RecentMeshes::Get().Find(key)) {
+        mesh = *found;
+        return true;
+    }
+    if (!SmKernel::Tessellate(entity.Body(), kernelOptions, mesh))
+        return false;
+    RecentMeshes::Get().Add(key, entity.m_body, mesh);
+    return true;
 }
 
 //! Central second moments of a region, from its products about the origin.
@@ -300,6 +386,63 @@ struct Moments {
     }
 };
 
+//=======================================================================================
+// Recently restored bodies by their persisted bytes. Displaying an element restores its b-reps
+// again for every tile it appears in, and rebuilding Parasolid data is far slower than
+// reading SMLib's. Bodies are never modified once restored, so entities can share them.
+// Accessed with SmKernel::Mutex() held.
+//=======================================================================================
+struct RestoredBodies {
+    struct Entry {
+        std::string m_bytes;
+        BodyRef m_body;
+        std::vector<uint32_t> m_faceSymbology;
+        double m_scale = 1.0;
+        std::shared_ptr<std::optional<DRange3d>> m_range;
+    };
+    static constexpr size_t kCapacity = 4096;
+    std::list<Entry> m_entries; // most recently used first
+    std::unordered_multimap<size_t, std::list<Entry>::iterator> m_index;
+
+    static RestoredBodies& Get() {
+        static RestoredBodies* s_bodies = new RestoredBodies(); // never destroyed: bodies outlive static teardown
+        return *s_bodies;
+    }
+
+    Entry const* Find(std::string_view bytes) {
+        auto range = m_index.equal_range(std::hash<std::string_view>()(bytes));
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second->m_bytes == bytes) {
+                m_entries.splice(m_entries.begin(), m_entries, it->second);
+                return &*it->second;
+            }
+        }
+        return nullptr;
+    }
+
+    void Add(Entry entry) {
+        size_t const hash = std::hash<std::string_view>()(entry.m_bytes);
+        m_entries.push_front(std::move(entry));
+        m_index.emplace(hash, m_entries.begin());
+        while (m_entries.size() > kCapacity) {
+            auto last = std::prev(m_entries.end());
+            auto range = m_index.equal_range(std::hash<std::string_view>()(last->m_bytes));
+            for (auto it = range.first; it != range.second; ++it) {
+                if (it->second == last) {
+                    m_index.erase(it);
+                    break;
+                }
+            }
+            m_entries.pop_back();
+        }
+    }
+
+    void Clear() {
+        m_index.clear();
+        m_entries.clear();
+    }
+};
+
 } // namespace
 
 /*---------------------------------------------------------------------------------**//**
@@ -307,23 +450,43 @@ struct Moments {
 +---------------+---------------+---------------+---------------+---------------+------*/
 static bool s_sessionStarted = false;
 void SMLibKernelAdmin::_StartSession() const { s_sessionStarted = true; }
-void SMLibKernelAdmin::_StopSession() const { s_sessionStarted = false; }
+void SMLibKernelAdmin::_StopSession() const {
+    s_sessionStarted = false;
+    Lock lock(SmKernel::Mutex());
+    RestoredBodies::Get().Clear();
+    RecentMeshes::Get().Clear();
+}
 bool SMLibKernelAdmin::_IsSessionStarted() const { return s_sessionStarted; }
 
 /*---------------------------------------------------------------------------------**//**
 * @bsimethod
 +---------------+---------------+---------------+---------------+---------------+------*/
 BentleyStatus SMLibKernelAdmin::_RestoreEntityFromMemory(IBRepEntityPtr& out, uint8_t const* buffer, size_t bufferSize, TransformCR transform) const {
-    std::vector<uint32_t> faceSymbology;
-    SmKernel::BodyPtr body;
+    if (nullptr == buffer || 0 == bufferSize)
+        return ERROR;
+    std::string_view const bytes(reinterpret_cast<char const*>(buffer), bufferSize);
+    RestoredBodies::Entry restored;
     {
         Lock lock(SmKernel::Mutex());
-        body = SmKernel::Restore(buffer, bufferSize, faceSymbology);
+        if (auto found = RestoredBodies::Get().Find(bytes)) {
+            restored = *found;
+        } else {
+            SmKernel::BodyPtr body = SmKernel::Restore(buffer, bufferSize, restored.m_faceSymbology, restored.m_scale);
+            if (!body)
+                return ERROR;
+            restored.m_range = std::make_shared<std::optional<DRange3d>>();
+            restored.m_body = Share(std::move(body));
+            restored.m_bytes.assign(bytes);
+            RestoredBodies::Get().Add(restored);
+        }
     }
-    if (!body)
-        return ERROR;
-    auto entity = new SMLibEntity(Share(std::move(body)), transform);
-    entity->m_faceSymbology.assign(faceSymbology.begin(), faceSymbology.end());
+    // A body rebuilt from Parasolid data may be scaled to suit SMLib.
+    Transform entityTransform = transform;
+    if (1.0 != restored.m_scale)
+        entityTransform.ScaleMatrixColumns(1.0 / restored.m_scale, 1.0 / restored.m_scale, 1.0 / restored.m_scale);
+    auto entity = new SMLibEntity(restored.m_body, entityTransform);
+    entity->m_localRange = restored.m_range;
+    entity->m_faceSymbology.assign(restored.m_faceSymbology.begin(), restored.m_faceSymbology.end());
     out = entity;
     return SUCCESS;
 }
@@ -437,21 +600,53 @@ BentleyStatus SMLibKernelAdmin::_GetAreaProperties(IBRepEntityCR in, double& are
 * Volume properties are exact from SMLib, then mapped through the entity transform: for
 * x' = Ax + t, the central second-moment matrix becomes |det A| A S A^T.
 +---------------+---------------+---------------+---------------+---------------+------*/
-BentleyStatus SMLibKernelAdmin::_GetVolumeProperties(IBRepEntityCR in, double& volume, double& area, DPoint3dR centroid, DPoint3dR moments, double& iXY, double& iXZ, double& iYZ, double tolerance) const {
+BentleyStatus SMLibKernelAdmin::_GetVolumeProperties(IBRepEntityCR in, double& volume, double& area, DPoint3dR centroid, DPoint3dR moments, double& iXY, double& iXZ, double& iYZ, double) const {
     auto entity = SMLibEntity::From(in);
     if (nullptr == entity || IBRepEntity::EntityType::Solid != in.GetEntityType())
         return ERROR;
 
-    DRange3d range = in.GetLocalEntityRange();
-    double const diagonal = range.IsNull() ? 1.0 : range.low.Distance(range.high);
-    double const scale = MaxScale(entity->m_transform);
-    double const relative = std::clamp(tolerance > 0.0 && diagonal > 0.0 && scale > 0.0 ? tolerance / (diagonal * scale) : 1.0e-4, 1.0e-4, 1.0e-1);
+    // Callers pass Parasolid's accuracy (1.0 by default) rather than a length. SMLib's results stop
+    // improving at a relative accuracy of 1e-4, which costs little, so always ask for that.
+    double const relative = 1.0e-4;
 
     SmKernel::MassProperties props;
+    bool integrated;
     {
         Lock lock(SmKernel::Mutex());
-        if (!SmKernel::GetMassProperties(entity->Body(), relative, props))
+        integrated = SmKernel::GetMassProperties(entity->Body(), relative, props) && std::isfinite(props.volume) && props.volume > 0.0;
+    }
+    if (!integrated) {
+        // SMLib can't integrate some thin bodies; their fine tessellations are still good.
+        IFacetOptionsPtr options = IFacetOptions::Create();
+        DRange3d const range = in.GetEntityRange();
+        options->SetChordTolerance(range.IsNull() ? 0.0 : 1.0e-4 * range.low.Distance(range.high));
+        options->SetAngleTolerance(Angle::DegreesToRadians(5.0));
+        options->SetNormalsRequired(false);
+        options->SetEdgeHiding(false);
+        SmKernel::Mesh mesh;
+        if (!Tessellate(*entity, *options, mesh))
             return ERROR;
+        auto polyface = ToPolyfaces(mesh, 1, [](uint32_t) { return size_t(0); }, *entity, *options).front();
+        DVec3d first;
+        double const amount = polyface->SumTetrahedralFirstMoments(DPoint3d::FromZero(), first);
+        if (!(std::fabs(amount) > 0.0))
+            return ERROR;
+        DPoint3d const c = DPoint3d::From(first.x / amount, first.y / amount, first.z / amount);
+        double tetrahedra;
+        DVec3d unused;
+        RotMatrix products;
+        polyface->SumTetrahedralMomentProducts(Transform::From(-c.x, -c.y, -c.z), tetrahedra, unused, products);
+        double const sign = tetrahedra < 0.0 ? -1.0 : 1.0;
+        Moments m;
+        m.amount = std::fabs(tetrahedra);
+        m.centroid = c;
+        m.xx = sign * products.form3d[0][0]; m.yy = sign * products.form3d[1][1]; m.zz = sign * products.form3d[2][2];
+        m.xy = sign * products.form3d[0][1]; m.xz = sign * products.form3d[0][2]; m.yz = sign * products.form3d[1][2];
+        volume = m.amount;
+        area = polyface->SumFacetAreas();
+        centroid = m.centroid;
+        m.ToOutputs(moments, iXY, iXZ, iYZ);
+        return SUCCESS;
     }
 
     // Central second moments S from the inertia moments: Ixx = Syy + Szz, ...

@@ -88,7 +88,8 @@ void Report(char const* name, BodyPtr const& body, Kind expectedKind, double exp
         ++s_failures;
     std::vector<uint8_t> saved;
     std::vector<uint32_t> tags;
-    if (!Save(*body, tags, saved) || !Restore(saved.data(), saved.size(), tags)) {
+    double scale;
+    if (!Save(*body, tags, saved) || !Restore(saved.data(), saved.size(), tags, scale)) {
         std::printf("FAIL %-28s save/restore\n", name);
         ++s_failures;
     }
@@ -236,12 +237,13 @@ int main() {
         Boolean(again, Box(-4, -4, -5, 4, 4, 5), BooleanOp::Intersect);
         std::vector<uint8_t> saved;
         std::vector<uint32_t> tags;
+        double scale;
         Save(*again, tags, saved);
-        again = Restore(saved.data(), saved.size(), tags);
+        again = Restore(saved.data(), saved.size(), tags, scale);
         ok = Hollow(again, -0.5);
         std::printf("     restored hollow %s\n", ok ? "ok" : "failed");
         Save(*again, tags, saved);
-        again = Restore(saved.data(), saved.size(), tags);
+        again = Restore(saved.data(), saved.size(), tags, scale);
         ok = Boolean(again, Extrude({{Circle(0, 0, -6, 1)}}, up, 12), BooleanOp::Subtract);
         std::printf("     restored cut %s\n", ok ? "ok" : "failed");
     });

@@ -2,7 +2,7 @@
 * Copyright (c) Bentley Systems, Incorporated. All rights reserved.
 * See LICENSE.md in the repository root for full copyright notice.
 *--------------------------------------------------------------------------------------------*/
-#include "SmKernel.h"
+#include "SmKernelImpl.h"
 
 #include <SmApiBrep.h>
 #include <SmApiGeneral.h>
@@ -19,6 +19,7 @@
 #include <SmPoly.h>
 #include <SmSurface.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -47,8 +48,6 @@ bool GetU32(uint8_t const*& data, uint8_t const* end, uint32_t& value) {
     return true;
 }
 
-SmContext& Context() { return *SmApiGetOrCreateContext(); }
-
 //! Surface parameters of a point on a face, (0,0) if they can't be found.
 SmPoint2d SurfaceParams(SmFace* face, SmPoint3d const& point) {
     SmSurface* surface = face ? face->GetSurface() : nullptr;
@@ -68,20 +67,16 @@ void GetFaces(SmBrep const& brep, SmTArray<SmFace*>& faces) {
 
 } // namespace
 
-struct Body {
-    SmBrep* m_brep;
-    explicit Body(SmBrep* brep) : m_brep(brep) { }
-    ~Body() { delete m_brep; }
-};
+SmContext& Context() { return *SmApiGetOrCreateContext(); }
 
 std::recursive_mutex& Mutex() {
-    static std::recursive_mutex s_mutex;
-    return s_mutex;
+    static std::recursive_mutex* s_mutex = new std::recursive_mutex(); // never destroyed: bodies may be released during static teardown
+    return *s_mutex;
 }
 
 void Delete(Body* body) { delete body; }
 
-static BodyPtr Wrap(SmBrep* brep) { return brep ? BodyPtr(new Body(brep)) : BodyPtr(); }
+BodyPtr Wrap(SmBrep* brep) { return brep ? BodyPtr(new Body(brep)) : BodyPtr(); }
 
 /*---------------------------------------------------------------------------------**//**
 * The payload is the magic, a format version, the face tags (count then values), then SMLib's
@@ -119,8 +114,11 @@ bool Save(Body const& body, std::vector<uint32_t> const& faceTags, std::vector<u
     }
 }
 
-BodyPtr Restore(uint8_t const* data, size_t size, std::vector<uint32_t>& faceTags) {
-    if (nullptr == data || size < 8 || 0 != std::memcmp(data, kMagic, 4))
+BodyPtr Restore(uint8_t const* data, size_t size, std::vector<uint32_t>& faceTags, double& scale) {
+    scale = 1.0;
+    if (nullptr != data && size >= 4 && 0 != std::memcmp(data, kMagic, 4))
+        return RestoreParasolid(data, size, faceTags, scale);
+    if (nullptr == data || size < 8)
         return nullptr;
     uint8_t const* cursor = data + 4;
     uint8_t const* end = data + size;
@@ -239,6 +237,10 @@ bool Transform(Body& body, double const m[3][4]) {
 bool Tessellate(Body const& body, TessellationOptions const& options, Mesh& mesh) {
     SmTessellationParams params;
     params.dChordHeightTol = options.chordTolerance;
+    // Far finer than any display needs, and SMLib can take minutes on curved faces near it.
+    SmPoint3d low, high;
+    if (params.dChordHeightTol > 0.0 && SM_SUCCESS == SmApiBrepBoundingBox(body.m_brep, FALSE, low, high))
+        params.dChordHeightTol = std::max(params.dChordHeightTol, 1.0e-5 * SmVector3d(high - low).Length());
     params.dCurveAngleTolDeg = options.angleToleranceDegrees;
     params.dSurfaceAngleTolDeg = options.angleToleranceDegrees;
     params.dMaxEdgeLength = options.maxEdgeLength;
@@ -466,6 +468,8 @@ struct CurveArray {
     void Release() { m_curves.SetSize(0); }
 };
 
+} // namespace
+
 SmBSplineCurve* ToSmCurve(Curve const& curve) {
     size_t const count = curve.poles.size() / 3;
     if (curve.degree < 1 || count < 2 || curve.knots.size() != count + curve.degree + 1 || (!curve.weights.empty() && curve.weights.size() != count))
@@ -492,6 +496,8 @@ SmBSplineCurve* ToSmCurve(Curve const& curve) {
         return nullptr;
     return result;
 }
+
+namespace {
 
 bool AddCurves(Curves const& curves, CurveArray& out) {
     for (Curve const& curve : curves) {
