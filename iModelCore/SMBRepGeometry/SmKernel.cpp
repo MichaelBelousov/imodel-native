@@ -8,6 +8,8 @@
 #include <SmApiGeneral.h>
 #include <SmApiPrimitives.h>
 #include <SmApiQueries.h>
+#include <SmApiTrimmedSurfaces.h>
+#include <SmPrimitiveCreation.h>
 #include <SmBrep.h>
 #include <SmBrepData.h>
 #include <SmCurve.h>
@@ -446,6 +448,432 @@ bool Boolean(BodyPtr& target, BodyPtr tool, BooleanOp op) {
     // On success SMLib deleted the tool's brep and modified the target's in place.
     tool->m_brep = nullptr;
     target->m_brep = result;
+    return true;
+}
+
+/*---------------------------------------------------------------------------------**//**
+* Curves and the operations built from them
++---------------+---------------+---------------+---------------+---------------+------*/
+namespace {
+
+//! Owns SMLib curves until they are released to an operation that consumes them.
+struct CurveArray {
+    SmTArray<SmCurve*> m_curves;
+    ~CurveArray() {
+        for (ULONG i = 0; i < m_curves.GetSize(); ++i)
+            delete m_curves[i];
+    }
+    void Release() { m_curves.SetSize(0); }
+};
+
+SmBSplineCurve* ToSmCurve(Curve const& curve) {
+    size_t const count = curve.poles.size() / 3;
+    if (curve.degree < 1 || count < 2 || curve.knots.size() != count + curve.degree + 1 || (!curve.weights.empty() && curve.weights.size() != count))
+        return nullptr;
+    SmTArray<SmPoint3d> poles;
+    for (size_t i = 0; i < count; ++i)
+        poles.Add(SmPoint3d(curve.poles[3 * i], curve.poles[3 * i + 1], curve.poles[3 * i + 2]));
+    SmTArray<double> knots;
+    SmTArray<ULONG> multiplicities;
+    double const span = curve.knots.back() - curve.knots.front();
+    for (double knot : curve.knots) {
+        if (knots.GetSize() > 0 && std::fabs(knot - knots[knots.GetSize() - 1]) <= 1.0e-12 * span) {
+            multiplicities[multiplicities.GetSize() - 1]++;
+        } else {
+            knots.Add(knot);
+            multiplicities.Add(1);
+        }
+    }
+    SmTArray<double> weights;
+    for (double weight : curve.weights)
+        weights.Add(weight);
+    SmBSplineCurve* result = nullptr;
+    if (SM_SUCCESS != SmBSplineCurve::CreateCanonical(Context(), 3, curve.degree, poles, SM_CF_UNSPECIFIED, multiplicities, knots, SM_KT_UNSPECIFIED, curve.weights.empty() ? nullptr : &weights, nullptr, result))
+        return nullptr;
+    return result;
+}
+
+bool AddCurves(Curves const& curves, CurveArray& out) {
+    for (Curve const& curve : curves) {
+        SmBSplineCurve* smCurve = ToSmCurve(curve);
+        if (nullptr == smCurve)
+            return false;
+        out.m_curves.Add(smCurve);
+    }
+    return true;
+}
+
+SmBrep* Release(BodyPtr& body) {
+    SmBrep* brep = body->m_brep;
+    body->m_brep = nullptr;
+    body.reset();
+    return brep;
+}
+
+} // namespace
+
+BodyPtr CreatePlanarSheet(std::vector<Curves> const& loops) {
+    try {
+        CurveArray curves;
+        for (Curves const& loop : loops) {
+            if (!AddCurves(loop, curves))
+                return nullptr;
+        }
+        SmBrep* brep = nullptr;
+        if (SM_SUCCESS != SmApiCreatePlanarFaces(curves.m_curves, brep) || nullptr == brep)
+            return nullptr;
+        curves.Release();
+        return Wrap(brep);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+BodyPtr Extrude(std::vector<Curves> const& loops, double const direction[3], double distance, bool cap) {
+    try {
+        CurveArray curves;
+        for (Curves const& loop : loops) {
+            if (!AddCurves(loop, curves))
+                return nullptr;
+        }
+        SmBrep* brep = nullptr;
+        if (SM_SUCCESS != SmApiCreateLinearSweep(curves.m_curves, Vec(direction), distance, cap ? TRUE : FALSE, brep) || nullptr == brep)
+            return nullptr;
+        return Wrap(brep);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+namespace {
+
+using Vec3 = SmVector3d;
+
+Vec3 PoleOf(Curve const& curve, size_t i) { return Vec3(curve.poles[3 * i], curve.poles[3 * i + 1], curve.poles[3 * i + 2]); }
+
+//! Apply x -> pivot + R (x - pivot) + shift to every pole, where R rotates `from` onto `to`.
+void Move(Curves& curves, Vec3 const& pivot, Vec3 const& from, Vec3 const& to, Vec3 const& shift) {
+    Vec3 axis = from * to;
+    double const sine = axis.Length(), cosine = from.Dot(to);
+    if (sine > 1.0e-14)
+        axis = axis / sine;
+    for (Curve& curve : curves) {
+        for (size_t i = 0; i < curve.poles.size() / 3; ++i) {
+            Vec3 v = PoleOf(curve, i) - pivot;
+            if (sine > 1.0e-14) // Rodrigues
+                v = v * cosine + (axis * v) * sine + axis * (axis.Dot(v) * (1.0 - cosine));
+            v = v + pivot + shift;
+            curve.poles[3 * i] = v.x;
+            curve.poles[3 * i + 1] = v.y;
+            curve.poles[3 * i + 2] = v.z;
+        }
+    }
+}
+
+//! Keep the part of the body on the side of the plane its normal points to.
+bool ClipToHalfSpace(BodyPtr& body, Vec3 const& origin, Vec3 normal, double size) {
+    normal = normal / normal.Length();
+    Vec3 const reference = std::fabs(normal.z) < 0.9 ? Vec3(0, 0, 1) : Vec3(1, 0, 0);
+    Vec3 x = reference * normal;
+    x = x / x.Length();
+    Vec3 const y = normal * x;
+    SmBrep* box = nullptr;
+    if (SM_SUCCESS != SmApiCreateBox(Vec3(-size, -size, 0), 2 * size, 2 * size, size, box))
+        return false;
+    BodyPtr halfSpace = Wrap(box);
+    if (SM_SUCCESS != SmApiTransform(box, SmAxis2Placement(origin, x, y)))
+        return false;
+    return Boolean(body, std::move(halfSpace), BooleanOp::Intersect);
+}
+
+//! Sweep along line segments with mitered corners: one extrusion per segment, each clipped by
+//! the planes that bisect its corners, all united.
+BodyPtr SweepPolyline(Curves profile, std::vector<Vec3> const& points) {
+    size_t const segments = points.size() - 1;
+    std::vector<Vec3> directions;
+    std::vector<double> lengths;
+    double total = 0.0;
+    for (size_t i = 0; i < segments; ++i) {
+        Vec3 d = points[i + 1] - points[i];
+        lengths.push_back(d.Length());
+        directions.push_back(d / lengths.back());
+        total += lengths.back();
+    }
+    double radius = 0.0;
+    for (Curve const& curve : profile)
+        for (size_t i = 0; i < curve.poles.size() / 3; ++i)
+            radius = std::max(radius, Vec3(PoleOf(curve, i) - points[0]).Length());
+    double const margin = total + 4.0 * radius;
+    double const size = 10.0 * (total + radius);
+
+    BodyPtr result;
+    for (size_t i = 0; i < segments; ++i) {
+        if (i > 0) {
+            if (directions[i - 1].Dot(directions[i]) < -0.99)
+                return nullptr; // turns back on itself
+            Move(profile, points[i], directions[i - 1], directions[i], Vec3(0, 0, 0));
+        }
+        double const back = i > 0 ? margin : 0.0, ahead = i + 1 < segments ? margin : 0.0;
+        Curves start = profile;
+        Move(start, points[i], directions[i], directions[i], directions[i] * -back);
+        double const direction[3] = {directions[i].x, directions[i].y, directions[i].z};
+        BodyPtr piece = Extrude({start}, direction, back + lengths[i] + ahead);
+        if (!piece)
+            return nullptr;
+        if (i > 0 && !ClipToHalfSpace(piece, points[i], directions[i - 1] + directions[i], size))
+            return nullptr;
+        if (i + 1 < segments && !ClipToHalfSpace(piece, points[i + 1], (directions[i] + directions[i + 1]) * -1.0, size))
+            return nullptr;
+        if (!result)
+            result = std::move(piece);
+        else if (!Boolean(result, std::move(piece), BooleanOp::Unite))
+            return nullptr;
+        Move(profile, points[i], directions[i], directions[i], directions[i] * lengths[i]);
+    }
+    return result;
+}
+
+} // namespace
+
+BodyPtr Sweep(Curves const& profile, Curves const& path) {
+    if (path.empty())
+        return nullptr;
+    try {
+        // A path of line segments: sweep piecewise with mitered corners.
+        std::vector<Vec3> points;
+        bool linear = true;
+        for (Curve const& curve : path) {
+            if (1 != curve.degree) {
+                linear = false;
+                break;
+            }
+            for (size_t i = 0; i < curve.poles.size() / 3; ++i) {
+                Vec3 const point = PoleOf(curve, i);
+                if (points.empty() || Vec3(point - points.back()).Length() > 1.0e-10)
+                    points.push_back(point);
+            }
+        }
+        if (linear)
+            return points.size() < 2 ? nullptr : SweepPolyline(profile, points);
+        if (1 != path.size())
+            return nullptr;
+
+        CurveArray curves;
+        if (!AddCurves(profile, curves))
+            return nullptr;
+        SmBSplineCurve* smPath = ToSmCurve(path.front());
+        if (nullptr == smPath)
+            return nullptr;
+        SmObjDelete pathCleanup(smPath);
+        SmSweepOptions options;
+        options.bCapEndsArg = TRUE;
+        options.bMoveToProfile = TRUE;
+        SmBrep* brep = nullptr;
+        if (SM_SUCCESS != SmApiCreateCurveSweep(curves.m_curves, smPath, nullptr, nullptr, &options, brep, nullptr, nullptr, nullptr) || nullptr == brep)
+            return nullptr;
+        return Wrap(brep);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+BodyPtr Loft(std::vector<Curves> const& profiles) {
+    if (profiles.size() < 2)
+        return nullptr;
+    try {
+        CurveArray curves;
+        SmTArray<ULONG> counts;
+        for (Curves const& profile : profiles) {
+            if (!AddCurves(profile, curves))
+                return nullptr;
+            counts.Add(static_cast<ULONG>(profile.size()));
+        }
+        SmTArray<SmCurve const*> constCurves;
+        for (ULONG i = 0; i < curves.m_curves.GetSize(); ++i)
+            constCurves.Add(curves.m_curves[i]);
+        ULONG const degree = static_cast<ULONG>(std::min<size_t>(3, profiles.size() - 1));
+        SmBrep* brep = nullptr;
+        if (SM_SUCCESS != SmApiCreateSkinPrimitive(counts, constCurves, degree, TRUE, brep, nullptr, nullptr, nullptr) || nullptr == brep)
+            return nullptr;
+        return Wrap(brep);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+BodyPtr Sew(std::vector<BodyPtr> sheets) {
+    if (sheets.empty() || !sheets.front())
+        return nullptr;
+    try {
+        BodyPtr result = std::move(sheets.front());
+        for (size_t i = 1; i < sheets.size(); ++i) {
+            if (!sheets[i] || SM_SUCCESS != result->m_brep->MergeBrep(*sheets[i]->m_brep))
+                return nullptr;
+        }
+        SmBoolean solid = FALSE;
+        ULONG stitched = 0;
+        double vertexGap = 0.0, edgeGap = 0.0;
+        if (SM_SUCCESS != SmApiStitchIntoSolid(result->m_brep, solid, stitched, vertexGap, edgeGap))
+            return nullptr;
+        return result;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+namespace {
+
+//! The order to try SMLib's offset modes in. Extended offsets keep corners sharp, but on curved
+//! bodies they tend to fail, and a failed shell or offset can leave SMLib state that breaks later
+//! operations, so curved bodies try rounded corners first.
+std::vector<SmBoolean> OffsetModes(Body const& body) {
+    if (HasCurvedFaceOrEdge(body))
+        return {FALSE, TRUE};
+    return {TRUE, FALSE};
+}
+
+//! A solid result must enclose a positive volume. SMLib sometimes reports success for a broken one.
+bool IsValidResult(Body const& body, Kind expected) {
+    if (GetKind(body) != expected)
+        return false;
+    if (Kind::Solid != expected)
+        return true;
+    MassProperties props;
+    return GetMassProperties(body, 1.0e-3, props) && std::isfinite(props.volume) && props.volume > 0.0;
+}
+
+} // namespace
+
+bool Offset(BodyPtr& body, double distance) {
+    try {
+        Kind const kind = GetKind(*body);
+        // The input may be left modified on failure, so each attempt works on a copy.
+        for (SmBoolean extended : OffsetModes(*body)) {
+            BodyPtr copy = Copy(*body);
+            SmBrep* result = nullptr;
+            if (copy && SM_SUCCESS == SmApiOffsetBrepFull(copy->m_brep, distance, extended, TRUE, result) && nullptr != result) {
+                BodyPtr offset = result == copy->m_brep ? std::move(copy) : Wrap(result);
+                if (!IsValidResult(*offset, kind))
+                    return false;
+                body = std::move(offset);
+                return true;
+            }
+        }
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool Hollow(BodyPtr& body, double distance) {
+    try {
+        for (SmBoolean extended : OffsetModes(*body)) {
+            SmBrep* result = nullptr;
+            SmTArray<SmFace const*> keep;
+            if (SM_SUCCESS == SmApiShellBrepFull(body->m_brep, distance, extended, TRUE, FALSE, keep, result) && nullptr != result) {
+                BodyPtr shell = Wrap(result);
+                if (!IsValidResult(*shell, Kind::Solid))
+                    return false;
+                body = std::move(shell);
+                return true;
+            }
+        }
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool Thicken(BodyPtr& body, double front, double back) {
+    if (front + back <= 0.0)
+        return false;
+    if (back > 0.0 && !Offset(body, -back))
+        return false;
+    try {
+        for (SmBoolean extended : OffsetModes(*body)) {
+            SmBrep* result = nullptr;
+            SmTArray<SmFace const*> keep;
+            if (SM_SUCCESS == SmApiShellBrepFull(body->m_brep, front + back, extended, TRUE, TRUE, keep, result) && nullptr != result) {
+                BodyPtr solid = Wrap(result);
+                if (!IsValidResult(*solid, Kind::Solid))
+                    return false;
+                body = std::move(solid);
+                return true;
+            }
+        }
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool Round(BodyPtr& body, double radius) {
+    try {
+        SmTArray<SmEdge*> all, sharp;
+        body->m_brep->GetEdges(all);
+        for (ULONG i = 0; i < all.GetSize(); ++i) {
+            if (!all[i]->IsLamina() && !all[i]->IsSeam())
+                sharp.Add(all[i]);
+        }
+        if (0 == sharp.GetSize())
+            return false;
+        return SM_SUCCESS == SmApiFilletEdges(body->m_brep, sharp, radius, 1, 1, 1.0);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool KeepHalfSpace(BodyPtr& body, double const origin[3], double const normal[3]) {
+    try {
+        double low[3], high[3];
+        if (!GetRange(*body, low, high))
+            return false;
+        Vec3 const point = Vec(origin);
+        double const size = 10.0 * (Vec3(Vec(high) - Vec(low)).Length() + Vec3(Vec(low) - point).Length() + 1.0);
+        return ClipToHalfSpace(body, point, Vec(normal), size);
+    } catch (...) {
+        return false;
+    }
+}
+
+std::vector<BodyPtr> Separate(BodyPtr body) {
+    std::vector<BodyPtr> result;
+    try {
+        SmBrep* brep = Release(body);
+        SmTArray<SmBrep*> parts;
+        if (SM_SUCCESS != SmBrep::CreateOneBrepPerBody(brep, parts)) {
+            delete brep;
+            return result;
+        }
+        for (ULONG i = 0; i < parts.GetSize(); ++i)
+            result.push_back(Wrap(parts[i]));
+    } catch (...) {
+    }
+    return result;
+}
+
+bool GetPlane(Body const& body, double origin[3], double normal[3]) {
+    SmTArray<SmFace*> faces;
+    GetFaces(*body.m_brep, faces);
+    if (0 == faces.GetSize())
+        return false;
+    SmPoint3d point;
+    SmVector3d direction;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        SmSurface* surface = faces[i]->GetSurface();
+        SmPoint3d facePoint;
+        SmVector3d faceNormal;
+        if (nullptr == surface || !surface->IsPlanar(1.0e-8, &facePoint, &faceNormal))
+            return false;
+        if (0 == i) {
+            point = facePoint;
+            direction = faceNormal;
+        } else if (std::fabs(std::fabs(faceNormal.Dot(direction)) - 1.0) > 1.0e-8 || std::fabs(SmVector3d(facePoint - point).Dot(direction)) > 1.0e-8) {
+            return false;
+        }
+    }
+    origin[0] = point.x; origin[1] = point.y; origin[2] = point.z;
+    normal[0] = direction.x; normal[1] = direction.y; normal[2] = direction.z;
     return true;
 }
 

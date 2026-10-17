@@ -78,7 +78,46 @@ BodyPtr CreateCone(double const base[3], double const top[3], double baseRadius,
 BodyPtr CreateTorus(double const center[3], double const axis[3], double majorRadius, double minorRadius);
 
 enum class BooleanOp { Unite, Subtract, Intersect };
-//! Combine tool into target. On success target holds the result.
+//! Combine tool into target. On success target holds the result, which may have no faces.
 bool Boolean(BodyPtr& target, BodyPtr tool, BooleanOp op);
+
+//! A clamped NURBS curve.
+struct Curve {
+    int degree = 1;
+    std::vector<double> poles;   //!< xyz triples
+    std::vector<double> weights; //!< one per pole, or empty if not rational
+    std::vector<double> knots;   //!< the full knot vector, poles + degree + 1 values
+};
+//! Curves joined end to end: a closed loop or an open path.
+using Curves = std::vector<Curve>;
+
+//! A sheet of the planar region bounded by the loops (outer and holes).
+BodyPtr CreatePlanarSheet(std::vector<Curves> const& loops);
+//! The solid swept by the planar region bounded by the loops along a vector, or only its side
+//! walls (a sheet) if not capped.
+BodyPtr Extrude(std::vector<Curves> const& loops, double const direction[3], double distance, bool cap = true);
+//! The capped solid swept by a closed profile along a path that starts on the profile. The path
+//! is either line segments, swept with mitered corners, or a single smooth curve.
+BodyPtr Sweep(Curves const& profile, Curves const& path);
+//! A solid lofted through closed profiles, capped at the first and last.
+BodyPtr Loft(std::vector<Curves> const& profiles);
+//! Join sheets that share edges. The result is a solid if they close.
+BodyPtr Sew(std::vector<BodyPtr> sheets);
+
+//! Offset every face; positive moves outwards (along the face normals of a sheet).
+bool Offset(BodyPtr& body, double distance);
+//! Turn a solid into a shell of the given thickness; positive grows outwards, negative inwards.
+bool Hollow(BodyPtr& body, double distance);
+//! Turn a sheet into a solid by offsetting it front along its normal and back against it.
+bool Thicken(BodyPtr& body, double front, double back);
+//! Round every edge between two faces, except seams. Smooth edges are not told apart.
+bool Round(BodyPtr& body, double radius);
+//! Keep the part of the body on the side of the plane its normal points to.
+bool KeepHalfSpace(BodyPtr& body, double const origin[3], double const normal[3]);
+//! One body per connected lump.
+std::vector<BodyPtr> Separate(BodyPtr body);
+
+//! The plane of a body whose faces are all on one plane, with the normal of its first face.
+bool GetPlane(Body const& body, double origin[3], double normal[3]);
 
 } // namespace SmKernel

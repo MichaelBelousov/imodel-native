@@ -20,6 +20,7 @@ zig build addon                       # zig-out/imodeljs-linux-x64/{imodeljs.nod
 zig build addon -Doptimize=ReleaseFast
 zig build smoke                       # create an ECDb and an iModel with the built addon
 zig build iTwinPlatform               # any single library, by its bmake name
+zig build smkernel-test               # check the SMLib operations behind createBRepGeometry
 ```
 
 `imodeljs-linux-x64/` has the layout `@bentley/imodeljs-native` expects next to its
@@ -35,12 +36,13 @@ node zig/brep-test.js zig-out/imodeljs-linux-x64/imodeljs.node path/to/node_modu
 
 - **B-reps use SMLib instead of Parasolid** (`iModelCore/SMBRepGeometry`). Bodies are stored under
   the usual `ParasolidBRep` geometry opcode, tagged as SMLib data.
-  - Supported: faceting with per-face symbology, volume and area properties, and
-    `createBRepGeometry` for unite, subtract and intersect of b-reps, boxes, spheres, cones,
-    cylinders and tori.
+  - Supported: faceting with per-face symbology, volume and area properties, and every
+    `createBRepGeometry` operation on b-reps, boxes, spheres, cones, cylinders, tori and planar
+    regions. Sweep paths are line segments (with mitered corners) or a single smooth curve. A
+    sheet subtracted from or intersected with a solid must be planar; it acts as a half space.
+    Emboss works on solids and planar regions.
   - Not supported: reading Parasolid b-reps in existing iModels. They fail to restore, as on a
-    platform without a solid kernel. The other `createBRepGeometry` operations and b-rep snapping
-    also report failure.
+    platform without a solid kernel. B-rep snapping also reports failure.
 - **Visualization is a stub** (`iModelCore/Visualization`). It produces no tiles, and element
   graphics requests resolve as `NoGeometry`.
 - **No crash reporting.** Crashpad isn't built; `iModelJsNodeAddon/CrashReportingNone.cpp` stands in

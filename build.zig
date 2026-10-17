@@ -493,6 +493,29 @@ fn installAssets(b: *std.Build, dir: []const u8) *std.Build.Step {
         const file = b.fmt("{s}.ecschema.xml", .{name});
         step.dependOn(&b.addInstallFileWithDir(b.path(b.fmt("iModelCore/ECDb/ECDb/ECSchemas/{s}", .{file})), .{ .custom = assets }, b.fmt("ECSchemas/ECDb/{s}", .{file})).step);
     }
+    // EC2 schemas that schema conversion and the published schema locaters expect beside the
+    // EC3 standard schemas.
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "schemas/ECStandards/EC3ConversionSchemas/MetaSchema_V3Conversion.02.04", "V3Conversion" },
+        .{ "schemas/ECStandards/schemas/General/Bentley_Common_Classes.01.01", "Standard" },
+        .{ "schemas/ECStandards/schemas/Bentley_ECSchemaMap.01.00", "Standard" },
+        .{ "schemas/ECStandards/schemas/Bentley_Standard_Classes.01.01", "Standard" },
+        .{ "schemas/ECStandards/schemas/Bentley_Standard_CustomAttributes.01.14", "Standard" },
+        .{ "schemas/ECStandards/schemas/ECDbMap.01.00", "Standard" },
+        .{ "schemas/ECStandards/schemas/ECv3ConversionAttributes.01.01", "Standard" },
+        .{ "schemas/ECStandards/schemas/EditorCustomAttributes.01.03", "Standard" },
+        .{ "schemas/ECStandards/schemas/LibraryUnits/Dimension_Schema.01.00", "Standard" },
+        .{ "schemas/ECStandards/schemas/LibraryUnits/KindOfQuantity_Schema.01.01", "Standard" },
+        .{ "schemas/ECStandards/schemas/LibraryUnits/SIUnitSystemDefaults.01.00", "Standard" },
+        .{ "schemas/ECStandards/schemas/LibraryUnits/USCustomaryUnitSystemDefaults.01.00", "Standard" },
+        .{ "schemas/ECStandards/schemas/LibraryUnits/Unit_Attributes.01.00", "Standard" },
+        .{ "schemas/ECStandards/schemas/LibraryUnits/Units_Schema.01.00", "Standard" },
+        .{ "schemas/ECStandards/schemas/LibraryUnits/iip_mdb_customAttributes.01.00", "Standard" },
+        .{ "schemas/ECStandards/schemas/LibraryUnits/rdl_customAttributes.01.00", "Standard" },
+    }) |schema| {
+        const name = std.fs.path.basename(schema[0]);
+        step.dependOn(&b.addInstallFileWithDir(b.path(b.fmt("{s}.ecschema.xml", .{schema[0]})), .{ .custom = assets }, b.fmt("ECSchemas/{s}/{s}.ecschema.xml", .{ schema[1], name })).step);
+    }
     const bis = b.dependency("bis_schemas", .{});
     for (bis_schemas) |schema| {
         step.dependOn(&b.addInstallFileWithDir(bis.path(schema.src), .{ .custom = assets }, b.fmt("ECSchemas/{s}", .{schema.dest})).step);
@@ -524,6 +547,12 @@ fn smlibBRep(ctx: *const Ctx) *Compile {
     });
     kernel.root_module.addIncludePath(usd_brep.path("source/SMLib/inc"));
     kernel.root_module.addIncludePath(usd_brep.path("source/SM_API/inc"));
+
+    const test_mod = b.createModule(.{ .target = ctx.target, .optimize = ctx.optimize, .link_libc = true, .link_libcpp = true });
+    test_mod.addCSourceFile(.{ .file = b.path("iModelCore/SMBRepGeometry/test/SmKernelTest.cpp"), .flags = &.{"-std=c++20"} });
+    test_mod.linkLibrary(kernel);
+    const run_test = b.addRunArtifact(b.addExecutable(.{ .name = "smkernel-test", .root_module = test_mod }));
+    b.step("smkernel-test", "Check the SMLib operations behind createBRepGeometry").dependOn(&run_test.step);
 
     return ctx.lib("iTwinSMBRepGeometry", .{
         .sources = &.{"iModelCore/SMBRepGeometry/SMBRepGeometry.cpp"},

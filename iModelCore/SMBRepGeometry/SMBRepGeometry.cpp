@@ -484,7 +484,7 @@ BentleyStatus SMLibKernelAdmin::_GetVolumeProperties(IBRepEntityCR in, double& v
 }
 
 /*---------------------------------------------------------------------------------**//**
-* createBRepGeometry: booleans of b-reps and solid primitives.
+* createBRepGeometry
 +---------------+---------------+---------------+---------------+---------------+------*/
 namespace {
 
@@ -545,23 +545,383 @@ SmKernel::BodyPtr BodyFromSolidPrimitive(ISolidPrimitiveCR primitive) {
     return nullptr;
 }
 
-//! A body in the entries' coordinates for one geometry entry, or null if it isn't supported.
-SmKernel::BodyPtr BodyFromEntry(GeometryStreamIO::Reader const& reader, GeometryStreamIO::Operation const& op) {
+//! Polylines become one curve per segment so their corners are vertices.
+bool AddPrimitive(ICurvePrimitiveCR primitive, SmKernel::Curves& out) {
+    if (auto points = primitive.GetLineStringCP()) {
+        for (size_t i = 0; i + 1 < points->size(); ++i) {
+            DPoint3dCR a = (*points)[i], b = (*points)[i + 1];
+            if (a.IsEqual(b))
+                continue;
+            SmKernel::Curve line;
+            line.poles = {a.x, a.y, a.z, b.x, b.y, b.z};
+            line.knots = {0, 0, 1, 1};
+            out.push_back(std::move(line));
+        }
+        return true;
+    }
+    MSBsplineCurvePtr bspline = primitive.GetMSBsplineCurvePtr();
+    if (bspline.IsNull() || (bspline->IsClosed() && MSB_SUCCESS != bspline->MakeOpen(0.0)))
+        return false;
+    SmKernel::Curve curve;
+    curve.degree = bspline->GetIntOrder() - 1;
+    bvector<DPoint3d> poles;
+    bspline->GetUnWeightedPoles(poles);
+    for (DPoint3dCR pole : poles)
+        curve.poles.insert(curve.poles.end(), {pole.x, pole.y, pole.z});
+    if (bspline->rational) {
+        bvector<double> weights;
+        bspline->GetWeights(weights);
+        curve.weights.assign(weights.begin(), weights.end());
+    }
+    bvector<double> knots;
+    bspline->GetKnots(knots);
+    curve.knots.assign(knots.begin(), knots.end());
+    out.push_back(std::move(curve));
+    return true;
+}
+
+bool ToCurves(CurveVectorCR chain, SmKernel::Curves& out) {
+    for (auto const& primitive : chain) {
+        if (auto child = primitive->GetChildCurveVectorCP()) {
+            if (!ToCurves(*child, out))
+                return false;
+        } else if (!AddPrimitive(*primitive, out)) {
+            return false;
+        }
+    }
+    return !out.empty();
+}
+
+//! The loops of a region, or the one chain of a path.
+bool ToLoops(CurveVectorCR curves, std::vector<SmKernel::Curves>& loops) {
+    if (curves.IsParityRegion()) {
+        for (auto const& primitive : curves) {
+            auto loop = primitive->GetChildCurveVectorCP();
+            if (nullptr == loop || !ToLoops(*loop, loops))
+                return false;
+        }
+        return !loops.empty();
+    }
+    if (!curves.IsClosedPath() && !curves.IsOpenPath())
+        return false;
+    loops.emplace_back();
+    return ToCurves(curves, loops.back());
+}
+
+void Translate(std::vector<SmKernel::Curves>& loops, DVec3dCR shift) {
+    for (auto& loop : loops)
+        for (auto& curve : loop)
+            for (size_t i = 0; i < curve.poles.size(); i += 3) {
+                curve.poles[i] += shift.x;
+                curve.poles[i + 1] += shift.y;
+                curve.poles[i + 2] += shift.z;
+            }
+}
+
+//! One createBRepGeometry input: a body, or curves that become a sheet body when one is needed.
+struct Input {
+    SmKernel::BodyPtr m_body;
+    CurveVectorPtr m_curves;
+
+    bool IsRegion() const { return m_curves.IsValid() && m_curves->IsAnyRegionType(); }
+
+    SmKernel::Kind Kind() {
+        if (m_body)
+            return SmKernel::GetKind(*m_body);
+        return IsRegion() ? SmKernel::Kind::Sheet : SmKernel::Kind::Wire;
+    }
+
+    //! The body, made from region curves if needed. Null for open curves.
+    SmKernel::BodyPtr TakeBody() {
+        if (!m_body && IsRegion()) {
+            std::vector<SmKernel::Curves> loops;
+            if (ToLoops(*m_curves, loops))
+                m_body = SmKernel::CreatePlanarSheet(loops);
+        }
+        return std::move(m_body);
+    }
+
+    bool GetLoops(std::vector<SmKernel::Curves>& loops) const { return m_curves.IsValid() && ToLoops(*m_curves, loops); }
+
+    //! The plane and orientation of planar region curves.
+    bool GetPlane(DPoint3dR origin, DVec3dR normal) const {
+        double area;
+        return IsRegion() && m_curves->CentroidNormalArea(origin, normal, area) && normal.Normalize() > 0.0;
+    }
+};
+
+bool ReadInput(GeometryStreamIO::Reader const& reader, GeometryStreamIO::Operation const& op, Input& input) {
     GeometricPrimitivePtr geometry;
     if (!reader.Get(op, geometry) || geometry.IsNull())
-        return nullptr;
+        return false;
+    if (auto curves = geometry->GetAsCurveVector(); curves.IsValid()) {
+        input.m_curves = curves;
+        return true;
+    }
+    if (auto curve = geometry->GetAsICurvePrimitive(); curve.IsValid()) {
+        input.m_curves = CurveVector::Create(CurveVector::BOUNDARY_TYPE_Open, curve);
+        return true;
+    }
     if (auto entity = geometry->GetAsIBRepEntity(); entity.IsValid()) {
         auto smEntity = SMLibEntity::From(*entity);
         if (nullptr == smEntity)
-            return nullptr;
-        auto body = SmKernel::Copy(smEntity->Body());
+            return false;
+        input.m_body = SmKernel::Copy(smEntity->Body());
         double matrix[3][4];
         ToMatrix(smEntity->m_transform, matrix);
-        return body && SmKernel::Transform(*body, matrix) ? std::move(body) : nullptr;
+        return input.m_body && SmKernel::Transform(*input.m_body, matrix);
     }
-    if (auto primitive = geometry->GetAsISolidPrimitive(); primitive.IsValid())
-        return BodyFromSolidPrimitive(*primitive);
-    return nullptr;
+    if (auto primitive = geometry->GetAsISolidPrimitive(); primitive.IsValid()) {
+        input.m_body = BodyFromSolidPrimitive(*primitive);
+        return nullptr != input.m_body;
+    }
+    return false;
+}
+
+DRange3d RangeOf(SmKernel::Body const& body) {
+    double low[3], high[3];
+    if (!SmKernel::GetRange(body, low, high))
+        return DRange3d::NullRange();
+    return DRange3d::From(DPoint3d::FromArray(low), DPoint3d::FromArray(high));
+}
+
+//! Signed distances of the range's corners from a plane.
+void Extent(DRange3dCR range, DPoint3dCR origin, DVec3dCR normal, double& low, double& high) {
+    DPoint3d corners[8];
+    range.Get8Corners(corners);
+    low = DBL_MAX;
+    high = -DBL_MAX;
+    for (DPoint3dCR corner : corners) {
+        double const d = normal.DotProduct(DVec3d::FromStartEnd(origin, corner));
+        low = std::min(low, d);
+        high = std::max(high, d);
+    }
+}
+
+SmKernel::BodyPtr Extrude(std::vector<SmKernel::Curves> const& loops, DVec3dCR direction, double distance, bool cap = true) {
+    double const d[3] = {direction.x, direction.y, direction.z};
+    return SmKernel::Extrude(loops, d, distance, cap);
+}
+
+//! Booleans of the target with the tools, where intersecting with several tools intersects with
+//! their union. A planar sheet tool is a half space bounded by its plane, with the material on the
+//! side opposite its normal.
+DgnDbStatus Combine(std::vector<Input>& inputs, SmKernel::BooleanOp op, SmKernel::BodyPtr& result) {
+    if (inputs.size() < 2)
+        return DgnDbStatus::BadArg;
+    if (SmKernel::BooleanOp::Intersect == op && inputs.size() > 2) {
+        SmKernel::BodyPtr tools;
+        for (size_t i = 1; i < inputs.size(); ++i) {
+            if (SmKernel::Kind::Solid != inputs[i].Kind())
+                return DgnDbStatus::BadArg;
+            auto tool = inputs[i].TakeBody();
+            if (!tools)
+                tools = std::move(tool);
+            else if (!SmKernel::Boolean(tools, std::move(tool), SmKernel::BooleanOp::Unite))
+                return DgnDbStatus::BadRequest;
+        }
+        inputs.resize(2);
+        inputs[1].m_body = std::move(tools);
+    }
+    result = inputs[0].TakeBody();
+    if (!result)
+        return DgnDbStatus::BadArg;
+    for (size_t i = 1; i < inputs.size(); ++i) {
+        if (SmKernel::Kind::Sheet == inputs[i].Kind() && SmKernel::Kind::Solid == SmKernel::GetKind(*result)) {
+            if (SmKernel::BooleanOp::Unite == op)
+                return DgnDbStatus::BadArg;
+            auto sheet = inputs[i].TakeBody();
+            double origin[3], normal[3];
+            if (!sheet || !SmKernel::GetPlane(*sheet, origin, normal))
+                return DgnDbStatus::NotEnabled; // only planar sheets
+            if (SmKernel::BooleanOp::Intersect == op)
+                normal[0] = -normal[0], normal[1] = -normal[1], normal[2] = -normal[2];
+            if (!SmKernel::KeepHalfSpace(result, origin, normal))
+                return DgnDbStatus::BadRequest;
+            continue;
+        }
+        auto tool = inputs[i].TakeBody();
+        if (!tool)
+            return DgnDbStatus::BadArg;
+        if (!SmKernel::Boolean(result, std::move(tool), op))
+            return DgnDbStatus::BadRequest;
+    }
+    return DgnDbStatus::Success;
+}
+
+//! Remove the material swept by a planar region along its normal, through the target or to a depth.
+DgnDbStatus Cut(std::vector<Input>& inputs, Napi::Object const& parameters, SmKernel::BodyPtr& result) {
+    std::vector<SmKernel::Curves> loops;
+    DPoint3d origin;
+    DVec3d normal;
+    if (inputs.size() != 2 || !inputs[1].GetLoops(loops) || !inputs[1].GetPlane(origin, normal))
+        return DgnDbStatus::BadArg;
+    result = inputs[0].TakeBody();
+    if (!result || SmKernel::Kind::Solid != SmKernel::GetKind(*result))
+        return DgnDbStatus::BadArg;
+
+    auto distanceValue = parameters.Get("distance");
+    bool const both = parameters.Get("bothDirections").ToBoolean();
+    double distance;
+    if (distanceValue.IsNumber() && distanceValue.ToNumber().DoubleValue() > 0.0) {
+        distance = distanceValue.ToNumber().DoubleValue();
+    } else {
+        double low, high;
+        Extent(RangeOf(*result), origin, normal, low, high);
+        distance = std::max(std::fabs(low), std::fabs(high)) * 1.1 + 1.0;
+    }
+    if (both)
+        Translate(loops, DVec3d::FromScale(normal, -distance));
+    auto tool = Extrude(loops, normal, both ? 2.0 * distance : distance);
+    if (!tool || !SmKernel::Boolean(result, std::move(tool), SmKernel::BooleanOp::Subtract))
+        return DgnDbStatus::BadRequest;
+    return DgnDbStatus::Success;
+}
+
+//! Move a planar region against its normal until it reaches the target: a pad where the region
+//! starts outside a solid, a pocket where it starts inside, a dent in a planar sheet.
+DgnDbStatus Emboss(std::vector<Input>& inputs, SmKernel::BodyPtr& result) {
+    std::vector<SmKernel::Curves> loops;
+    DPoint3d origin;
+    DVec3d normal;
+    if (inputs.size() != 2 || !inputs[1].GetLoops(loops) || !inputs[1].GetPlane(origin, normal))
+        return DgnDbStatus::BadArg;
+    DVec3d const down = DVec3d::FromScale(normal, -1.0);
+
+    if (SmKernel::Kind::Sheet == inputs[0].Kind()) {
+        std::vector<SmKernel::Curves> targetLoops;
+        DPoint3d targetOrigin;
+        DVec3d targetNormal;
+        if (!inputs[0].GetLoops(targetLoops) || !inputs[0].GetPlane(targetOrigin, targetNormal))
+            return DgnDbStatus::NotEnabled; // only planar regions
+        double const height = normal.DotProduct(DVec3d::FromStartEnd(targetOrigin, origin));
+        if (!targetNormal.IsParallelTo(normal) || height <= 0.0)
+            return DgnDbStatus::BadArg;
+        auto walls = Extrude(loops, down, height, false);
+        auto cap = SmKernel::CreatePlanarSheet(loops);
+        auto projected = loops;
+        Translate(projected, DVec3d::FromScale(down, height));
+        targetLoops.insert(targetLoops.end(), projected.begin(), projected.end());
+        auto holed = SmKernel::CreatePlanarSheet(targetLoops);
+        if (!walls || !cap || !holed)
+            return DgnDbStatus::BadRequest;
+        std::vector<SmKernel::BodyPtr> sheets;
+        sheets.push_back(std::move(holed));
+        sheets.push_back(std::move(walls));
+        sheets.push_back(std::move(cap));
+        result = SmKernel::Sew(std::move(sheets));
+        return result ? DgnDbStatus::Success : DgnDbStatus::BadRequest;
+    }
+
+    result = inputs[0].TakeBody();
+    if (!result || SmKernel::Kind::Solid != SmKernel::GetKind(*result))
+        return DgnDbStatus::BadArg;
+    double low, high;
+    Extent(RangeOf(*result), origin, normal, low, high);
+    double const tolerance = 1.0e-8 * (high - low);
+    SmKernel::BooleanOp op;
+    double depth;
+    if (high <= tolerance) {
+        op = SmKernel::BooleanOp::Unite; // into the middle of the target, so the pad joins it
+        depth = -high + 0.5 * (high - low);
+    } else if (low < -tolerance) {
+        op = SmKernel::BooleanOp::Subtract;
+        depth = -low * 1.1 + tolerance;
+    } else {
+        return DgnDbStatus::BadArg; // the target is in front of the region
+    }
+    auto tool = Extrude(loops, down, depth);
+    if (!tool || !SmKernel::Boolean(result, std::move(tool), op))
+        return DgnDbStatus::BadRequest;
+    return DgnDbStatus::Success;
+}
+
+double NumberOf(Napi::Object const& parameters, char const* name, double fallback) {
+    auto value = parameters.Get(name);
+    return value.IsNumber() ? value.ToNumber().DoubleValue() : fallback;
+}
+
+DgnDbStatus Apply(int operation, std::vector<Input>& inputs, Napi::Object const& parameters, SmKernel::BodyPtr& result) {
+    if (inputs.empty())
+        return DgnDbStatus::BadArg;
+    auto single = [&](SmKernel::Kind kind) -> bool {
+        if (1 != inputs.size() || kind != inputs[0].Kind())
+            return false;
+        result = inputs[0].TakeBody();
+        return nullptr != result;
+    };
+    switch (operation) {
+        case 0: return Combine(inputs, SmKernel::BooleanOp::Unite, result);
+        case 1: return Combine(inputs, SmKernel::BooleanOp::Subtract, result);
+        case 2: return Combine(inputs, SmKernel::BooleanOp::Intersect, result);
+        case 3: { // Sew
+            std::vector<SmKernel::BodyPtr> sheets;
+            for (auto& input : inputs) {
+                if (SmKernel::Kind::Sheet != input.Kind())
+                    return DgnDbStatus::BadArg;
+                sheets.push_back(input.TakeBody());
+                if (!sheets.back())
+                    return DgnDbStatus::BadArg;
+            }
+            result = SmKernel::Sew(std::move(sheets));
+            break;
+        }
+        case 4: return Cut(inputs, parameters, result);
+        case 5: return Emboss(inputs, result);
+        case 6: { // Thicken
+            double const front = std::max(0.0, NumberOf(parameters, "frontDistance", 0.0)), back = std::max(0.0, NumberOf(parameters, "backDistance", 0.0));
+            if (!single(SmKernel::Kind::Sheet) || front + back <= 0.0)
+                return DgnDbStatus::BadArg;
+            if (!SmKernel::Thicken(result, front, back))
+                result.reset();
+            break;
+        }
+        case 7: { // Hollow
+            double const distance = NumberOf(parameters, "distance", 0.0);
+            if (!single(SmKernel::Kind::Solid) || 0.0 == distance)
+                return DgnDbStatus::BadArg;
+            if (!SmKernel::Hollow(result, distance))
+                result.reset();
+            break;
+        }
+        case 8: { // Sweep
+            std::vector<SmKernel::Curves> profile, path;
+            if (2 != inputs.size() || !inputs[0].GetLoops(profile) || 1 != profile.size() || !inputs[1].GetLoops(path) || 1 != path.size())
+                return DgnDbStatus::BadArg;
+            result = SmKernel::Sweep(profile.front(), path.front());
+            break;
+        }
+        case 9: { // Loft
+            std::vector<SmKernel::Curves> profiles;
+            for (auto const& input : inputs) {
+                std::vector<SmKernel::Curves> loops;
+                if (!input.GetLoops(loops) || 1 != loops.size())
+                    return DgnDbStatus::BadArg;
+                profiles.push_back(std::move(loops.front()));
+            }
+            result = SmKernel::Loft(profiles);
+            break;
+        }
+        case 10: { // Round
+            double const radius = NumberOf(parameters, "radius", 0.0);
+            if (radius <= 0.0 || 1 != inputs.size() || !(result = inputs[0].TakeBody()))
+                return DgnDbStatus::BadArg;
+            if (!SmKernel::Round(result, radius))
+                result.reset();
+            break;
+        }
+        case 11: { // Offset
+            double const distance = NumberOf(parameters, "distance", 0.0);
+            if (0.0 == distance || 1 != inputs.size() || !(result = inputs[0].TakeBody()))
+                return DgnDbStatus::BadArg;
+            if (!SmKernel::Offset(result, distance))
+                result.reset();
+            break;
+        }
+        default:
+            return DgnDbStatus::BadArg;
+    }
+    return result ? DgnDbStatus::Success : DgnDbStatus::BadRequest;
 }
 
 } // namespace
@@ -571,43 +931,44 @@ DgnDbStatus SMLibKernelAdmin::_CreateBRepGeometry(DgnDbR db, Napi::Object const&
     auto entries = createProps.Get("entryArray");
     if (!onResult.IsFunction() || !entries.IsArray())
         return DgnDbStatus::BadArg;
-
-    SmKernel::BooleanOp op;
-    switch (createProps.Get("operation").ToNumber().Int32Value()) {
-        case 0: op = SmKernel::BooleanOp::Unite; break;
-        case 1: op = SmKernel::BooleanOp::Subtract; break;
-        case 2: op = SmKernel::BooleanOp::Intersect; break;
-        default: return DgnDbStatus::NotEnabled; // Sew, Cut, Emboss, Thicken, ... aren't supported yet
-    }
+    auto parametersValue = createProps.Get("parameters");
+    Napi::Object parameters = parametersValue.IsObject() ? parametersValue.As<Napi::Object>() : Napi::Object::New(env);
 
     auto entryArray = entries.As<Napi::Array>();
-    if (entryArray.Length() < 2)
-        return DgnDbStatus::BadArg;
-
     GeometryStreamIO::Reader reader(db);
-    SmKernel::BodyPtr result;
+    std::vector<IBRepEntityPtr> entities;
     {
         Lock lock(SmKernel::Mutex());
+        std::vector<Input> inputs(entryArray.Length());
         for (uint32_t i = 0; i < entryArray.Length(); ++i) {
-            auto body = BodyFromEntry(reader, GeometryStreamIO::ToOperation(entryArray.Get(i)));
-            if (!body)
+            if (!ReadInput(reader, GeometryStreamIO::ToOperation(entryArray.Get(i)), inputs[i]))
                 return DgnDbStatus::BadArg;
-            if (0 == i)
-                result = std::move(body);
-            else if (!SmKernel::Boolean(result, std::move(body), op))
-                return DgnDbStatus::BadRequest;
+        }
+        SmKernel::BodyPtr result;
+        DgnDbStatus status = Apply(createProps.Get("operation").ToNumber().Int32Value(), inputs, parameters, result);
+        if (DgnDbStatus::Success != status)
+            return status;
+
+        std::vector<SmKernel::BodyPtr> bodies;
+        if (createProps.Get("separateDisjoint").ToBoolean())
+            bodies = SmKernel::Separate(std::move(result));
+        else
+            bodies.push_back(std::move(result));
+        for (auto& body : bodies) {
+            if (body && SmKernel::GetFaceCount(*body) > 0) // an empty result is a success with no geometry
+                entities.push_back(new SMLibEntity(Share(std::move(body)), Transform::FromIdentity()));
         }
     }
 
-    IBRepEntityPtr entity = new SMLibEntity(Share(std::move(result)), Transform::FromIdentity());
-    GeometryStreamIO::Writer writer(db);
-    writer.Append(*entity);
-
     Napi::Array resultEntries = Napi::Array::New(env);
     uint32_t index = 0;
-    for (auto const& egOp : GeometryStreamIO::Collection(writer.m_buffer.data(), writer.m_buffer.size())) {
-        if (GeometryStreamIO::OpCode::Header != egOp.m_opCode)
-            resultEntries.Set(index++, GeometryStreamIO::FromOperation(egOp, env));
+    for (auto const& entity : entities) {
+        GeometryStreamIO::Writer writer(db);
+        writer.Append(*entity);
+        for (auto const& egOp : GeometryStreamIO::Collection(writer.m_buffer.data(), writer.m_buffer.size())) {
+            if (GeometryStreamIO::OpCode::Header != egOp.m_opCode)
+                resultEntries.Set(index++, GeometryStreamIO::FromOperation(egOp, env));
+        }
     }
 
     auto info = Napi::Object::New(env);
